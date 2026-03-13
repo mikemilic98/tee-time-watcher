@@ -7,6 +7,13 @@ from . import notifications
 from .config import settings
 from .database import Base, engine
 from .models.user import User
+from .models.course import Course
+from .models.watch_rule import WatchRule
+from .models.scan_job import ScanJob
+from .models.booking import Booking
+from .models.tee_time_candidate import TeeTimeCandidate
+from .models.user_course_credential import UserCourseCredential
+from .models.notification import InAppNotification
 from .auth import get_current_user
 from .schemas.user import UserRead
 from .monitoring import setup_monitoring

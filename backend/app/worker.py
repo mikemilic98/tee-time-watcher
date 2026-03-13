@@ -2,109 +2,11 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
-from typing import Optional
-
-from sqlalchemy.orm import Session
-
-from .database import SessionLocal
-from .models.scan_job import ScanJob, ScanJobStatus
-from .models.watch_rule import WatchRule
-from .queue import dequeue_next_scan_job
-
-
-logger = logging.getLogger(__name__)
-
-
-def _get_db() -> Session:
-    return SessionLocal()
-
-
-def _load_scan_job(db: Session, job_id: int) -> Optional[ScanJob]:
-    return db.query(ScanJob).get(job_id)
-
-
-def _process_scan_job(db: Session, job: ScanJob) -> None:
-    job.status = ScanJobStatus.IN_PROGRESS
-    job.started_at = datetime.now(timezone.utc)
-    db.add(job)
-    db.commit()
-
-    try:
-        rule: WatchRule | None = db.query(WatchRule).get(job.watch_rule_id)
-        if not rule or not rule.active:
-            job.status = ScanJobStatus.DONE
-            job.finished_at = datetime.now(timezone.utc)
-            db.add(job)
-            db.commit()
-            return
-
-        # TODO: Integrate with real course adapters and scraping/booking flows.
-        logger.info("Processed placeholder scan job %s for watch rule %s", job.id, job.watch_rule_id)
-
-        job.status = ScanJobStatus.DONE
-        job.finished_at = datetime.now(timezone.utc)
-        db.add(job)
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Error while processing scan job %s: %s", job.id, exc)
-        job.status = ScanJobStatus.FAILED
-        job.finished_at = datetime.now(timezone.utc)
-        job.last_error = str(exc)
-        db.add(job)
-        db.commit()
-
-
-def run_worker_once() -> bool:
-    """
-    Dequeue and process a single scan job.
-
-    Returns True if a job was processed, False if the queue was empty.
-    """
-    payload = dequeue_next_scan_job()
-    if not payload:
-        return False
-
-    job_id = payload.get("job_id")
-    if job_id is None:
-        logger.warning("Dequeued payload without job_id: %s", payload)
-        return False
-
-    db = _get_db()
-    try:
-        job = _load_scan_job(db, int(job_id))
-        if not job:
-            logger.warning("ScanJob %s not found in database", job_id)
-            return True
-        _process_scan_job(db, job)
-        return True
-    finally:
-        db.close()
-
-
-def run_worker_forever(poll_interval_seconds: float = 1.0) -> None:
-    """
-    Run a simple loop that continuously polls Redis for scan jobs.
-    """
-    logger.info("Worker started with poll interval %.2f seconds", poll_interval_seconds)
-    while True:
-        had_job = run_worker_once()
-        if not had_job:
-            time.sleep(poll_interval_seconds)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    run_worker_forever()
-
-from __future__ import annotations
-
 from datetime import datetime, timedelta, timezone
-import logging
 
 from sqlalchemy.orm import Session
 
-from .database import SessionLocal
+from .database import SessionLocal, engine, Base
 from .integrations import DemoCourseAdapter
 from .models.booking import Booking, BookingStatus
 from .models.course import Course
@@ -114,9 +16,10 @@ from .models.user_course_credential import UserCourseCredential
 from .models.watch_rule import WatchRule
 from .queue import dequeue_next_scan_job
 from .security import DecryptedCourseCredentials, decrypt_credential_payload
+from .config import settings
 
 
-logger = logging.getLogger("tee_time_app")
+logger = logging.getLogger(__name__)
 
 
 def _load_decrypted_credentials(creds: UserCourseCredential | None) -> DecryptedCourseCredentials | None:
@@ -142,7 +45,7 @@ def _load_decrypted_credentials(creds: UserCourseCredential | None) -> Decrypted
 
 
 def _process_single_job(db: Session, job_id: int) -> None:
-    job: ScanJob | None = db.query(ScanJob).get(job_id)
+    job: ScanJob | None = db.get(ScanJob, job_id)
     if not job:
         return
     job.status = ScanJobStatus.IN_PROGRESS
@@ -151,16 +54,22 @@ def _process_single_job(db: Session, job_id: int) -> None:
     db.commit()
 
     try:
-        rule: WatchRule | None = db.query(WatchRule).get(job.watch_rule_id)
+        rule: WatchRule | None = db.get(WatchRule, job.watch_rule_id)
         if not rule:
             job.status = ScanJobStatus.FAILED
             job.last_error = "WatchRule not found"
+            job.finished_at = datetime.now(timezone.utc)
+            db.add(job)
+            db.commit()
             return
 
-        course: Course | None = db.query(Course).get(rule.course_id)
+        course: Course | None = db.get(Course, rule.course_id)
         if not course:
             job.status = ScanJobStatus.FAILED
             job.last_error = "Course not found"
+            job.finished_at = datetime.now(timezone.utc)
+            db.add(job)
+            db.commit()
             return
 
         adapter = DemoCourseAdapter(course_id=course.id)
@@ -194,6 +103,8 @@ def _process_single_job(db: Session, job_id: int) -> None:
             db.add(candidate)
             db.flush()
 
+            # Normal path: require valid decrypted credentials and threshold
+            created_booking = False
             if (
                 decrypted_creds
                 and creds_row
@@ -221,11 +132,27 @@ def _process_single_job(db: Session, job_id: int) -> None:
                         auto_booked=True,
                     )
                     db.add(booking)
-                    continue
+                else:
+                    must_cancel_by = datetime.now(timezone.utc) + timedelta(
+                        hours=max(course.cancellation_policy_hours_before - 1, 1)
+                    )
+                    booking = Booking(
+                        user_id=rule.user_id,
+                        course_id=course.id,
+                        tee_time=result.tee_time,
+                        price=result.price_cents,
+                        num_players=result.num_players,
+                        status=BookingStatus.PENDING_USER_CONFIRM,
+                        external_reference=external_ref,
+                        auto_booked=True,
+                        must_cancel_by=must_cancel_by,
+                    )
+                    db.add(booking)
+                    created_booking = True
 
-                must_cancel_by = datetime.now(timezone.utc) + timedelta(
-                    hours=max(course.cancellation_policy_hours_before - 1, 1)
-                )
+            # Testing feature flag: if enabled, always create a pending booking
+            # even when credentials/threshold conditions are not met.
+            if settings.relaxed_worker_bookings and not created_booking:
                 booking = Booking(
                     user_id=rule.user_id,
                     course_id=course.id,
@@ -233,37 +160,65 @@ def _process_single_job(db: Session, job_id: int) -> None:
                     price=result.price_cents,
                     num_players=result.num_players,
                     status=BookingStatus.PENDING_USER_CONFIRM,
-                    external_reference=external_ref,
-                    auto_booked=True,
-                    must_cancel_by=must_cancel_by,
+                    auto_booked=False,
                 )
                 db.add(booking)
 
         job.status = ScanJobStatus.DONE
     except Exception as exc:
-        logger.exception("scan_job_failed", extra={"job_id": job.id})
-        job.status = ScanJobStatus.FAILED
-        job.last_error = str(exc)
+        job_id_cur = job.id
+        logger.exception("scan_job_failed", extra={"job_id": job_id_cur})
+        db.rollback()
+        job = db.get(ScanJob, job_id_cur)
+        if job:
+            job.status = ScanJobStatus.FAILED
+            job.last_error = str(exc)
+            job.finished_at = datetime.now(timezone.utc)
+            db.add(job)
+            db.commit()
+        return
     finally:
         job.finished_at = datetime.now(timezone.utc)
         db.add(job)
         db.commit()
 
 
-def run_worker_once() -> None:
+def run_worker_once() -> bool:
+    """
+    Dequeue and process a single scan job.
+    Returns True if a job was processed, False if the queue was empty.
+    """
     payload = dequeue_next_scan_job()
     if not payload:
-        return
+        return False
     job_id = payload.get("job_id")
-    if not isinstance(job_id, int):
-        return
+    if job_id is None:
+        logger.warning("Dequeued payload without job_id: %s", payload)
+        return False
+    try:
+        job_id = int(job_id)
+    except (TypeError, ValueError):
+        logger.warning("Invalid job_id in payload: %s", payload)
+        return False
+
     db: Session = SessionLocal()
     try:
         _process_single_job(db, job_id)
+        return True
     finally:
         db.close()
 
 
-if __name__ == "__main__":
-    run_worker_once()
+def run_worker_forever(poll_interval_seconds: float = 1.0) -> None:
+    """Poll Redis and process jobs until interrupted."""
+    logger.info("Worker started with poll interval %.2f seconds", poll_interval_seconds)
+    while True:
+        had_job = run_worker_once()
+        if not had_job:
+            time.sleep(poll_interval_seconds)
 
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    Base.metadata.create_all(bind=engine)  # ensure all tables exist when run standalone
+    run_worker_once()
